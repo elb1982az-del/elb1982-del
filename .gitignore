@@ -1,0 +1,30 @@
+# Local build environment
+android/local.properties
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+*.iml
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Sensitive / user-specific runtime files
+engine/allowed_networks.json
+**/allowed_networks.json
+*.log
+*.state
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Do not commit generated APKs; releases should come from CI.
+*.apk

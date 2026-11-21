@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">RouterXPL-Forge</string>
+    <string name="step_discover">Discover live devices</string>
+    <string name="step_fingerprint">Fingerprint + select modules</string>
+    <string name="step_checks">Run checks / exploits</string>
+    <string name="step_sessions">Sessions and results</string>
+</resources>
