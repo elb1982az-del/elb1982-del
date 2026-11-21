@@ -31,7 +31,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # GitHub-hosted ubuntu runners already include the Android SDK and
+      # cmdline-tools. Do not use android-actions/setup-android here: v3 still
+      # requests the removed `tools` package and fails on current images.
       - name: Build APK
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
