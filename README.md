@@ -10,6 +10,7 @@ An Android controller app for **authorized** router / embedded-device security t
 ## Built artifact
 
 - APK: `/opt/RouterXPL-Forge/RouterXPL-Forge.apk`
+- CI artifact: download `RouterXPL-Forge-debug` from the latest successful **Actions** run
 - Debug-signed, `minSdk 24`, `targetSdk 35`, package `com.routerxpl.forge`
 
 Install on the phone:
@@ -23,7 +24,7 @@ or copy the APK to the phone and open it, allowing installation of unknown apps.
 ## Architecture
 
 ```
-Android APK (Kotlin, framework-only)
+Android APK (Kotlin + Jetpack Compose / Material 3)
    |  su -c "chroot /kali python3 /opt/.../engine_cli.py <command> ..."
    v
 Kali NetHunter chroot
