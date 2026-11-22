@@ -1,0 +1,137 @@
+diff --git a/embedxpl/core/discovery.py b/embedxpl/core/discovery.py
+index fef1da5..35d9f5a 100644
+--- a/embedxpl/core/discovery.py
++++ b/embedxpl/core/discovery.py
+@@ -421,16 +421,17 @@ class NetworkDiscovery:
+         except ValueError:
+             return
+ 
+-        self._read_arp_table(network, seen_ips)
++        self._read_arp_table(network, seen_ips, callback)
+ 
+         self._ping_sweep(network, callback)
+ 
+-        self._read_arp_table(network, seen_ips)
++        self._read_arp_table(network, seen_ips, callback)
+ 
+     def _read_arp_table(
+         self,
+         network: ipaddress.IPv4Network,
+         seen_ips: Set[str],
++        callback: Optional[Callable] = None,
+     ) -> None:
+         """Read the OS ARP table and add discovered hosts."""
+         if sys.platform == "win32":
+@@ -465,6 +466,8 @@ class NetworkDiscovery:
+                     continue
+                 ip_str = parts[0]
+                 mac_str = parts[2].upper()
++                if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac_str):
++                    mac_str = ""
+ 
+             try:
+                 ip_obj = ipaddress.ip_address(ip_str)
+@@ -918,7 +921,7 @@ class NetworkDiscovery:
+         """Aggressive HTTP/HTTPS banner grab to extract device model from web UI."""
+         http_ports = [p for p in host.open_ports if p in (80, 8080, 8081, 8888, 8090, 443, 8443, 4567, 10000)]
+         if not http_ports:
+-            http_ports = [80, 443]
++            return
+ 
+         for port in http_ports:
+             use_ssl = port in (443, 8443)
+@@ -934,7 +937,7 @@ class NetworkDiscovery:
+         """Raw HTTP/HTTPS request to grab server headers and HTML title/model info."""
+         try:
+             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+-            s.settimeout(self.timeout + 2)
++            s.settimeout(min(self.timeout + 2, 2.0))
+             s.connect((ip, port))
+ 
+             if use_ssl:
+diff --git a/embedxpl/core/exploit/exploit.py b/embedxpl/core/exploit/exploit.py
+index 86f2758..04d89b2 100644
+--- a/embedxpl/core/exploit/exploit.py
++++ b/embedxpl/core/exploit/exploit.py
+@@ -184,10 +184,30 @@ def multi(fn):
+ 
+ 
+ class DummyFile(object):
+-    """ Mocking file object. Optimilization for the "mute" decorator. """
++    """ Mocking file object. Optimization for the "mute" decorator. """
+     def write(self, x):
+         pass
+ 
++    def flush(self):
++        pass
++
++    def isatty(self):
++        return False
++
++    def fileno(self):
++        return -1
++
++    def writable(self):
++        return True
++
++    @property
++    def encoding(self):
++        return "utf-8"
++
++    @property
++    def errors(self):
++        return "strict"
++
+ 
+ def mute(fn):
+     """ Suppress function from printing to sys.stdout """
+diff --git a/embedxpl/core/http/http_client.py b/embedxpl/core/http/http_client.py
+index 2d8eab6..818ea1a 100644
+--- a/embedxpl/core/http/http_client.py
++++ b/embedxpl/core/http/http_client.py
+@@ -23,6 +23,15 @@ class HTTPClient(Exploit):
+     verbosity = OptBool(True, "Verbosity enabled: true/false")
+     ssl = OptBool(False, "SSL enabled: true/false")
+ 
++    def _build_url(self, path: str) -> str:
++        """Build a request URL without duplicating scheme/host for absolute paths."""
++        scheme = "https://" if self.ssl else "http://"
++        if isinstance(path, str) and path.lower().startswith(("http://", "https://")):
++            return path
++        if isinstance(path, str) and path.startswith("//"):
++            return scheme.rstrip("/") + path
++        return scheme + "{}:{}{}".format(self.target, self.port, path)
++
+     def http_request(self, method: str, path: str, session: requests = requests, **kwargs) -> requests.Response:
+         """ Requests HTTP resource
+ 
+@@ -33,12 +42,7 @@ class HTTPClient(Exploit):
+         :return Response: Response object
+         """
+ 
+-        if self.ssl:
+-            url = "https://"
+-        else:
+-            url = "http://"
+-
+-        url += "{}:{}{}".format(self.target, self.port, path)
++        url = self._build_url(path)
+ 
+         kwargs.setdefault("timeout", HTTP_TIMEOUT)
+         kwargs.setdefault("verify", False)
+@@ -69,14 +73,7 @@ class HTTPClient(Exploit):
+         :return str: full target url with correct schema
+         """
+ 
+-        if self.ssl:
+-            url = "https://"
+-        else:
+-            url = "http://"
+-
+-        url += "{}:{}{}".format(self.target, self.port, path)
+-
+-        return url
++        return self._build_url(path)
+ 
+     def http_test_connect(self) -> bool:
+         """ Test connection to HTTP server

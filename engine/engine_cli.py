@@ -20,6 +20,8 @@ import io
 import ipaddress
 import json
 import os
+import re
+import socket
 import sys
 import time
 import traceback
@@ -33,6 +35,15 @@ ALLOWED_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "allowed_networks.json"),
 )
 DEFAULT_TIMEOUT = 120.0
+
+# The Android controller launches us with a pipe on stdin. Some dependency
+# code can block on a stdin read in that situation, so detach it immediately.
+try:
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull_fd, 0)
+    os.close(devnull_fd)
+except Exception:
+    pass
 
 if EMBEDXPL_ROOT not in sys.path:
     sys.path.insert(0, EMBEDXPL_ROOT)
@@ -81,6 +92,91 @@ def target_allowed(target: str) -> bool:
     except Exception:
         return False
     return False
+
+
+def allowed_networks() -> List[str]:
+    """Return the user-declared lab CIDRs."""
+    if not os.path.exists(ALLOWED_FILE):
+        return []
+    try:
+        with open(ALLOWED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        networks = data.get("networks", []) if isinstance(data, dict) else []
+        return [str(item) for item in networks]
+    except Exception:
+        return []
+
+
+def normalize_mac(mac: str) -> Optional[str]:
+    value = mac.strip().upper().replace("-", ":")
+    if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", value):
+        return None
+    return value
+
+
+def build_magic_packet(mac: str) -> bytes:
+    value = normalize_mac(mac)
+    if value is None:
+        raise ValueError("Invalid MAC address: {}".format(mac))
+    octets = bytes(int(part, 16) for part in value.split(":"))
+    return b"\xff" * 6 + octets * 16
+
+
+def cmd_wol(args: argparse.Namespace) -> int:
+    """Send a Wake-on-LAN magic packet inside a user-declared lab network."""
+    mac = normalize_mac(args.mac)
+    if mac is None:
+        return fail("wol", "Invalid MAC address: {}".format(args.mac))
+
+    try:
+        target_net = ipaddress.ip_network(args.network, strict=False)
+    except ValueError as exc:
+        return fail("wol", "Invalid network: {}".format(exc))
+
+    allowed = False
+    broadcasts: List[str] = []
+    for cidr in allowed_networks():
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if target_net.version != net.version:
+            continue
+        if target_net.subnet_of(net):
+            allowed = True
+            addr = str(net.broadcast_address)
+            if addr not in broadcasts:
+                broadcasts.append(addr)
+    if not allowed:
+        return fail(
+            "wol",
+            "Refusing: network is not inside allowed_networks.json. "
+            "Add your lab CIDR before sending Wake-on-LAN.",
+        )
+
+    packet = build_magic_packet(mac)
+    sent_to: List[str] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for broadcast in broadcasts + ["255.255.255.255"]:
+            for _ in range(max(1, min(args.count, 5))):
+                try:
+                    sock.sendto(packet, (broadcast, 9))
+                    if broadcast not in sent_to:
+                        sent_to.append(broadcast)
+                except OSError as exc:
+                    return fail("wol", "Broadcast failed on {}: {}".format(broadcast, exc))
+
+    emit({
+        "ok": True,
+        "command": "wol",
+        "mac": mac,
+        "network": str(target_net),
+        "broadcasts": sent_to,
+        "packet_bytes": len(packet),
+        "authorized_network": True,
+    })
+    return 0
 
 
 def module_dotted_path(human_path: str) -> str:
@@ -187,6 +283,106 @@ def cmd_discover(args: argparse.Namespace) -> int:
         return fail("discover", str(exc), traceback=traceback.format_exc()[-4000:])
 
 
+PORT_PROTOCOLS = {
+    21: "ftp",
+    22: "ssh",
+    23: "telnet",
+    53: "dns",
+    80: "http",
+    139: "smb",
+    161: "snmp",
+    162: "snmp",
+    443: "https",
+    445: "smb",
+    554: "rtsp",
+    1900: "upnp",
+    3389: "rdp",
+    5060: "sip",
+    5900: "vnc",
+    8080: "http",
+    8081: "http",
+    8443: "https",
+    8888: "http",
+    10000: "http",
+}
+
+LEGACY_TOKENS = (
+    "telnet",
+    "ftp",
+    "snmpv1",
+    "snmp v1",
+    "snmpv2",
+    "snmp v2",
+    "smbv1",
+    "smb v1",
+    "sslv3",
+    "ssl v3",
+    "tlsv1",
+    "tls 1.0",
+    "tls 1.1",
+    "wep",
+    "wps",
+    "rc4",
+    "md5",
+    "sha1",
+    "upnp",
+)
+
+
+def rank_module(dotted: str, meta: Dict[str, Any], port: Optional[int], host: Any) -> Dict[str, Any]:
+    """Score a module against a fingerprint and flag likely-fail matches."""
+    open_ports = list(getattr(host, "open_ports", []) or [])
+    banners = getattr(host, "banners", {}) or {}
+    vendor = str(getattr(host, "vendor_guess", "") or "").strip().lower()
+    model = str(getattr(host, "model_guess", "") or "").strip().lower()
+    devices = meta.get("devices", []) or []
+    if isinstance(devices, str):
+        devices = [devices]
+    haystack = " ".join(
+        [dotted, str(meta.get("name", "")), str(meta.get("description", ""))]
+        + [str(item) for item in devices]
+        + [str(value) for value in banners.values()]
+    ).lower()
+
+    score = 0
+    reasons: List[str] = []
+    if vendor and vendor in haystack:
+        score += 5
+        reasons.append("vendor match")
+    elif model and model in haystack:
+        score += 4
+        reasons.append("model match")
+
+    if port is not None:
+        if port in open_ports:
+            score += 4
+            reasons.append("port {} open".format(port))
+        else:
+            score -= 5
+            reasons.append("port {} not open".format(port))
+
+    for probe_port, protocol in PORT_PROTOCOLS.items():
+        if probe_port in open_ports and protocol in haystack:
+            score += 2
+            reasons.append("{} service".format(protocol))
+            break
+
+    legacy = []
+    for token in LEGACY_TOKENS:
+        if re.search(r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])", haystack):
+            legacy.append(token)
+    if legacy:
+        score -= 2
+        reasons.append("legacy protocol")
+
+    likely_fail = bool(legacy) or (port is not None and port not in open_ports)
+    return {
+        "score": score,
+        "likely_fail": likely_fail,
+        "reason": "; ".join(reasons),
+    }
+
+
 def cmd_fingerprint(args: argparse.Namespace) -> int:
     try:
         from embedxpl.core.discovery import NetworkDiscovery
@@ -202,14 +398,32 @@ def cmd_fingerprint(args: argparse.Namespace) -> int:
             try:
                 from embedxpl.core.exploit.utils import import_exploit
 
-                cls = import_exploit(dotted)
+                full_path = module_dotted_path(human)
+                cls = import_exploit(full_path)
+                instance = cls()
+                meta = module_metadata(instance)
+                port = getattr(instance, "port", None)
+                if not isinstance(port, int):
+                    port = None
+                ranked = rank_module(full_path, meta, port, host)
                 modules.append({
                     "path": human,
                     "title": getattr(cls, "title", "") or human,
-                    "metadata": module_metadata(cls()),
+                    "metadata": meta,
+                    "port": port,
+                    **ranked,
                 })
-            except Exception:  # noqa: BLE001 - skip modules that cannot load
-                modules.append({"path": human, "title": human, "metadata": {}})
+            except Exception as exc:  # noqa: BLE001 - skip modules that cannot load
+                modules.append({
+                    "path": human,
+                    "title": human,
+                    "metadata": {},
+                    "port": None,
+                    "score": -10,
+                    "likely_fail": True,
+                    "reason": "module could not be analyzed: {}".format(exc),
+                })
+        modules.sort(key=lambda item: (-int(item.get("score", 0)), item.get("path", "")))
         emit({
             "ok": True,
             "command": "fingerprint",
@@ -306,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     discover = sub.add_parser("discover", help="Discover live devices on a CIDR")
     discover.add_argument("--network", required=True)
-    discover.add_argument("--timing", type=int, default=3)
+    discover.add_argument("--timing", type=int, default=4)
 
     fingerprint = sub.add_parser("fingerprint", help="Fingerprint one host and list modules")
     fingerprint.add_argument("--target", required=True)
@@ -326,6 +540,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     run.add_argument("--confirm", default="")
 
+    wol = sub.add_parser("wol", help="Wake a previously discovered device on the lab network")
+    wol.add_argument("--mac", required=True, help="MAC address of the sleeping device")
+    wol.add_argument("--network", required=True, help="Lab CIDR the device belongs to")
+    wol.add_argument("--count", type=int, default=3)
+
     return parser
 
 
@@ -338,6 +557,7 @@ def main() -> int:
         "fingerprint": cmd_fingerprint,
         "check": cmd_check,
         "run": cmd_run,
+        "wol": cmd_wol,
     }
     try:
         return handlers[args.command](args)

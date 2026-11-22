@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -81,8 +82,9 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 private const val PREFS = "routerxpl_prefs"
-private const val DEFAULT_CHROOT = "/kali"
+private const val DEFAULT_CHROOT = "/data/local/nhsystem/kali-arm64"
 private const val DEFAULT_ENGINE = "/opt/RouterXPL-Forge/engine/engine_cli.py"
+private const val DEFAULT_PYTHON = "/opt/RouterXPL-Forge/.venv/bin/python"
 
 private val Green = Color(0xFF6EE787)
 private val DarkBg = Color(0xFF080C0A)
@@ -119,7 +121,15 @@ data class ResultEntry(
     val detail: String?,
 )
 
-class ResultsDb(context: Context) : SQLiteOpenHelper(context, "routerxpl_results.db", null, 1) {
+data class KnownDevice(
+    val ts: String,
+    val ip: String,
+    val mac: String,
+    val vendor: String,
+    val hostname: String,
+)
+
+class ResultsDb(context: Context) : SQLiteOpenHelper(context, "routerxpl_results.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -135,11 +145,34 @@ class ResultsDb(context: Context) : SQLiteOpenHelper(context, "routerxpl_results
             )
             """.trimIndent(),
         )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS known_devices (
+                ip TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                mac TEXT NOT NULL,
+                vendor TEXT,
+                hostname TEXT
+            )
+            """.trimIndent(),
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS results")
-        onCreate(db)
+        if (oldVersion < 1) {
+            db.execSQL("DROP TABLE IF EXISTS results")
+        }
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS known_devices (
+                ip TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                mac TEXT NOT NULL,
+                vendor TEXT,
+                hostname TEXT
+            )
+            """.trimIndent(),
+        )
     }
 
     fun insert(entry: ResultEntry) {
@@ -181,6 +214,48 @@ class ResultsDb(context: Context) : SQLiteOpenHelper(context, "routerxpl_results
         return out
     }
 
+    fun upsertKnown(hosts: List<JSONObject>) {
+        val db = writableDatabase
+        val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        hosts.forEach { host ->
+            val ip = host.optString("ip", "").trim()
+            val mac = host.optString("mac", "").trim()
+            if (ip.isEmpty() || mac.isEmpty()) return@forEach
+            db.execSQL(
+                "INSERT OR REPLACE INTO known_devices(ip,ts,mac,vendor,hostname) VALUES(?,?,?,?,?)",
+                arrayOf(
+                    ip,
+                    ts,
+                    mac,
+                    host.optString("vendor_guess", ""),
+                    host.optString("hostname", ""),
+                ),
+            )
+        }
+    }
+
+    fun allKnown(): List<KnownDevice> {
+        val out = mutableListOf<KnownDevice>()
+        val cursor: Cursor = readableDatabase.rawQuery(
+            "SELECT ts,ip,mac,vendor,hostname FROM known_devices ORDER BY ts DESC",
+            null,
+        )
+        cursor.use {
+            while (it.moveToNext()) {
+                out.add(
+                    KnownDevice(
+                        ts = it.getString(0),
+                        ip = it.getString(1),
+                        mac = it.getString(2),
+                        vendor = it.getString(3) ?: "",
+                        hostname = it.getString(4) ?: "",
+                    ),
+                )
+            }
+        }
+        return out
+    }
+
     fun toJson(): String {
         val arr = JSONArray()
         all().forEach { e ->
@@ -202,17 +277,44 @@ class ResultsDb(context: Context) : SQLiteOpenHelper(context, "routerxpl_results
 
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).map { getJSONObject(it) }
 
+private fun ipv4ToInt(ip: String): Long? {
+    val parts = ip.trim().split(".")
+    if (parts.size != 4) return null
+    var value = 0L
+    for (part in parts) {
+        val octet = part.toIntOrNull() ?: return null
+        if (octet < 0 || octet > 255) return null
+        value = (value shl 8) or octet.toLong()
+    }
+    return value
+}
+
+private fun ipInCidr(ip: String, cidr: String): Boolean {
+    val parts = cidr.trim().split("/")
+    if (parts.size != 2) return ip.trim() == cidr.trim()
+    val network = ipv4ToInt(parts[0]) ?: return false
+    val prefix = parts[1].toIntOrNull() ?: return false
+    val address = ipv4ToInt(ip) ?: return false
+    if (prefix < 0 || prefix > 32) return false
+    if (prefix == 0) return true
+    val mask = (0xFFFFFFFFL shl (32 - prefix)) and 0xFFFFFFFFL
+    return (network and mask) == (address and mask)
+}
+
 private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
 private fun engineCall(context: Context, args: List<String>, timeoutSeconds: Long): JSONObject {
     val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     val chroot = prefs.getString("chroot", DEFAULT_CHROOT)!!.trim()
     val engine = prefs.getString("engine", DEFAULT_ENGINE)!!.trim()
+    val python = prefs.getString("python", DEFAULT_PYTHON)!!.trim().ifEmpty { DEFAULT_PYTHON }
     val inner = buildString {
-        append("python3 ").append(shellQuote(engine))
+        append(shellQuote(python)).append(' ').append(shellQuote(engine))
         args.forEach { append(' ').append(shellQuote(it)) }
     }
-    val command = "chroot $chroot /bin/bash -lc $inner"
+    // The whole inner command must be a single argument to bash -lc; otherwise
+    // bash only receives the interpreter path and leaves the script/args unused.
+    val command = "chroot ${shellQuote(chroot)} /bin/bash -lc ${shellQuote(inner)}"
     return try {
         val process = ProcessBuilder("su", "-c", command)
             .redirectErrorStream(true)
@@ -275,6 +377,10 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
     var results by remember { mutableStateOf(db.all()) }
     var showConfirm by remember { mutableStateOf(false) }
     var confirmText by remember { mutableStateOf("") }
+    var knownDevices by remember { mutableStateOf(db.allKnown()) }
+    var sleepingDevices by remember { mutableStateOf<List<KnownDevice>>(emptyList()) }
+    var lastScannedNetwork by remember { mutableStateOf(network.trim()) }
+    var wakeTarget by remember { mutableStateOf<KnownDevice?>(null) }
 
     fun runStep(args: List<String>, onOk: (JSONObject) -> Unit) {
         scope.launch {
@@ -303,13 +409,30 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
     }
 
     fun discover() {
-        runStep(listOf("discover", "--network", network.trim())) { json ->
+        val scanned = network.trim()
+        runStep(listOf("discover", "--network", scanned)) { json ->
             devices = (json.optJSONArray("hosts") ?: JSONArray()).objects()
             selectedDevice = null
             fingerprint = null
             modules = emptyList()
             selectedModule = null
-            lastResult = "Discovered ${devices.size} live device(s). Tap one to fingerprint."
+            db.upsertKnown(devices)
+            knownDevices = db.allKnown()
+            lastScannedNetwork = scanned
+            val liveIps = devices.mapNotNull { it.optString("ip", "").takeIf { v -> v.isNotEmpty() } }.toSet()
+            sleepingDevices = knownDevices.filter { device ->
+                device.mac.matches(Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")) &&
+                    ipInCidr(device.ip, scanned) &&
+                    device.ip !in liveIps
+            }
+            lastResult = "Discovered ${devices.size} live device(s). " +
+                "${sleepingDevices.size} saved device(s) appear asleep."
+        }
+    }
+
+    fun wake(device: KnownDevice) {
+        runStep(listOf("wol", "--mac", device.mac, "--network", lastScannedNetwork)) { _ ->
+            lastResult = "Wake-on-LAN sent to ${device.ip} (${device.mac})."
         }
     }
 
@@ -319,6 +442,10 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
         runStep(listOf("fingerprint", "--target", target)) { json ->
             fingerprint = json.optJSONObject("host")
             modules = (json.optJSONArray("modules") ?: JSONArray()).objects()
+                .sortedWith(
+                    compareByDescending<JSONObject> { it.optInt("score", -100) }
+                        .thenBy { it.optString("path", "") }
+                )
             selectedModule = null
             lastResult = "Fingerprinted $target · ${modules.size} relevant module(s)."
         }
@@ -395,6 +522,32 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
         )
     }
 
+    if (wakeTarget != null) {
+        val target = wakeTarget!!
+        AlertDialog(
+            onDismissRequest = { wakeTarget = null },
+            title = { Text("Wake device", color = Green) },
+            text = {
+                Text(
+                    "Send a Wake-on-LAN magic packet to ${target.mac} (${target.ip})?\n\n" +
+                        "Only wake hardware you own on your lab network.",
+                    color = Muted,
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        wakeTarget = null
+                        wake(target)
+                    },
+                    enabled = !busy,
+                ) { Text("WAKE") }
+            },
+            dismissButton = { TextButton(onClick = { wakeTarget = null }) { Text("Cancel") } },
+        )
+    }
+
     Scaffold(
         containerColor = DarkBg,
         topBar = {
@@ -455,6 +608,7 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
                         prefs.edit().putString("network", it).apply()
                     },
                     devices = devices,
+                    sleepingDevices = sleepingDevices,
                     selectedDevice = selectedDevice,
                     fingerprint = fingerprint,
                     modules = modules,
@@ -463,6 +617,7 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
                     busy = busy,
                     onDiscover = { discover() },
                     onDevice = { doFingerprint(it) },
+                    onWake = { wakeTarget = it },
                     onModule = { selectedModule = it },
                     onCheck = { execute("check") },
                     onRun = {
@@ -532,6 +687,7 @@ fun WorkflowTab(
     network: String,
     onNetworkChange: (String) -> Unit,
     devices: List<JSONObject>,
+    sleepingDevices: List<KnownDevice>,
     selectedDevice: JSONObject?,
     fingerprint: JSONObject?,
     modules: List<JSONObject>,
@@ -540,6 +696,7 @@ fun WorkflowTab(
     busy: Boolean,
     onDiscover: () -> Unit,
     onDevice: (JSONObject) -> Unit,
+    onWake: (KnownDevice) -> Unit,
     onModule: (JSONObject) -> Unit,
     onCheck: () -> Unit,
     onRun: () -> Unit,
@@ -606,6 +763,46 @@ fun WorkflowTab(
             }
         }
 
+        Card(colors = CardDefaults.cardColors(containerColor = DarkSurface)) {
+            Column(Modifier.padding(12.dp)) {
+                Text("Sleeping / offline devices", fontWeight = FontWeight.Bold, color = Color.White)
+                Spacer(Modifier.height(6.dp))
+                if (sleepingDevices.isEmpty()) {
+                    Text(
+                        "No saved devices are missing from the last scan.",
+                        color = Muted,
+                        fontSize = 12.sp,
+                    )
+                } else {
+                    LazyColumn(Modifier.heightIn(max = 200.dp)) {
+                        itemsIndexed(sleepingDevices) { _, device ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(device.ip, fontWeight = FontWeight.Bold, color = Amber)
+                                    Text(
+                                        listOfNotNull(
+                                            device.mac,
+                                            device.vendor.ifEmpty { null },
+                                        ).joinToString(" · "),
+                                        fontSize = 11.sp,
+                                        color = Muted,
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { onWake(device) },
+                                    enabled = !busy,
+                                ) { Text("WAKE") }
+                            }
+                            Divider(color = DarkSurface2)
+                        }
+                    }
+                }
+            }
+        }
+
         StepHeader(2, "Fingerprint + modules", "Matched to vendor, model and open services")
         Card(colors = CardDefaults.cardColors(containerColor = DarkSurface)) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -613,8 +810,8 @@ fun WorkflowTab(
                     Text("Tap a device to fingerprint it.", color = Muted, fontSize = 12.sp)
                 } else {
                     Text("Target: ${fingerprint!!.optString("ip", selectedDevice?.optString("ip", "") ?: "")}", color = Color.White)
-                    Text("Vendor: ${fingerprint!!.optString("vendor_guess", "unknown")}", color = Muted, fontSize = 12.sp)
-                    Text("Model: ${fingerprint!!.optString("model_guess", "unknown")}", color = Muted, fontSize = 12.sp)
+                    Text("Vendor: ${fingerprint!!.optString("vendor_guess", "").ifEmpty { "Unknown" }}", color = Muted, fontSize = 12.sp)
+                    Text("Model: ${fingerprint!!.optString("model_guess", "").ifEmpty { "Unknown" }}", color = Muted, fontSize = 12.sp)
                     Row {
                         AssistChip(
                             onClick = {},
@@ -631,8 +828,9 @@ fun WorkflowTab(
                         LazyColumn(Modifier.heightIn(max = 200.dp)) {
                             itemsIndexed(modules) { _, mod ->
                                 val meta = mod.optJSONObject("metadata") ?: JSONObject()
-                                val title = meta.optString("name", mod.optString("title", ""))
+                                val title = meta.optString("name", "").ifEmpty { mod.optString("title", "").ifEmpty { "Unknown" } }
                                 val sev = meta.optString("severity", "")
+                                val likelyFail = mod.optBoolean("likely_fail", false)
                                 Surface(
                                     color = if (selectedModule?.optString("path") == mod.optString("path")) DarkSurface2 else DarkSurface,
                                     modifier = Modifier
@@ -640,7 +838,26 @@ fun WorkflowTab(
                                         .clickable { onModule(mod) },
                                 ) {
                                     Column(Modifier.padding(10.dp)) {
-                                        Text(mod.optString("path", ""), color = Green, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                mod.optString("path", ""),
+                                                color = Green,
+                                                fontSize = 12.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (likelyFail) {
+                                                Text(
+                                                    "LIKELY FAIL",
+                                                    color = Danger,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier
+                                                        .background(Color(0xFF3A1414))
+                                                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                                                )
+                                            }
+                                        }
                                         if (title.isNotEmpty()) Text(title, color = Color.White, fontSize = 12.sp)
                                         if (sev.isNotEmpty()) Text("severity: $sev", color = Amber, fontSize = 11.sp)
                                     }
@@ -662,6 +879,10 @@ fun WorkflowTab(
                     val meta = selectedModule!!.optJSONObject("metadata") ?: JSONObject()
                     Text(selectedModule!!.optString("path", ""), color = Green, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     Text(meta.optString("description", "").take(180), color = Muted, fontSize = 12.sp)
+                    val matchReason = selectedModule!!.optString("reason", "")
+                    if (matchReason.isNotEmpty()) {
+                        Text("Match: $matchReason", color = Muted, fontSize = 11.sp)
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = onCheck,
