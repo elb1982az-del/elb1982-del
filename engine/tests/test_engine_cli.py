@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 from dataclasses import dataclass
@@ -113,3 +114,53 @@ def test_jsonable_dataclass():
 
     value = engine_cli.jsonable(Example("192.168.1.1", [80, 443]))
     assert value == {"ip": "192.168.1.1", "ports": [80, 443]}
+
+
+def test_is_private_cidr():
+    assert engine_cli.is_private_cidr("192.168.0.0/24") is True
+    assert engine_cli.is_private_cidr("10.0.0.0/8") is True
+    assert engine_cli.is_private_cidr("172.16.5.0/24") is True
+    assert engine_cli.is_private_cidr("172.31.255.0/24") is True
+    assert engine_cli.is_private_cidr("8.8.8.0/24") is False
+    assert engine_cli.is_private_cidr("192.168.0.1") is False
+    assert engine_cli.is_private_cidr("fd00::/8") is False
+    assert engine_cli.is_private_cidr("garbage") is False
+
+
+def test_cmd_allow_writes_single_private_network(tmp_path, monkeypatch, capsys):
+    allow_file = tmp_path / "allowed_networks.json"
+    allow_file.write_text(
+        json.dumps({"networks": ["10.0.0.0/8", "192.168.1.0/24"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine_cli, "ALLOWED_FILE", str(allow_file))
+
+    rc = engine_cli.cmd_allow(argparse.Namespace(network=" 192.168.0.5/24 "))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["network"] == "192.168.0.0/24"
+    assert json.loads(allow_file.read_text(encoding="utf-8")) == {
+        "networks": ["192.168.0.0/24"]
+    }
+    assert engine_cli.allowed_networks() == ["192.168.0.0/24"]
+
+
+def test_cmd_allow_rejects_public_cidr_without_writing(tmp_path, monkeypatch, capsys):
+    allow_file = tmp_path / "allowed_networks.json"
+    allow_file.write_text(
+        json.dumps({"networks": ["192.168.0.0/24"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine_cli, "ALLOWED_FILE", str(allow_file))
+
+    rc = engine_cli.cmd_allow(argparse.Namespace(network="8.8.8.0/24"))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert "RFC1918" in payload["error"]
+    assert json.loads(allow_file.read_text(encoding="utf-8")) == {
+        "networks": ["192.168.0.0/24"]
+    }

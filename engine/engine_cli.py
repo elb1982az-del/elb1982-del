@@ -36,6 +36,9 @@ ALLOWED_FILE = os.environ.get(
 )
 DEFAULT_TIMEOUT = 120.0
 
+# Only RFC1918 IPv4 ranges may be written as the active lab allowlist from the app.
+PRIVATE_NETWORKS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
 # The Android controller launches us with a pipe on stdin. Some dependency
 # code can block on a stdin read in that situation, so detach it immediately.
 try:
@@ -105,6 +108,52 @@ def allowed_networks() -> List[str]:
         return [str(item) for item in networks]
     except Exception:
         return []
+
+
+def is_private_cidr(value: str) -> bool:
+    """Return True only for explicit private IPv4 CIDR text."""
+    if "/" not in value.strip():
+        return False
+    try:
+        network = ipaddress.ip_network(value.strip(), strict=False)
+    except (ValueError, TypeError):
+        return False
+    if network.version != 4:
+        return False
+    return any(network.subnet_of(ipaddress.ip_network(item)) for item in PRIVATE_NETWORKS)
+
+
+def cmd_allow(args: argparse.Namespace) -> int:
+    """Replace the lab allowlist with one app-supplied CIDR."""
+    if "/" not in args.network.strip():
+        return fail("allow", "CIDR must include a prefix, e.g. 192.168.0.0/24.")
+    try:
+        network = ipaddress.ip_network(args.network.strip(), strict=False)
+    except (ValueError, TypeError):
+        return fail("allow", "Invalid CIDR: {}".format(args.network))
+
+    if network.version != 4:
+        return fail("allow", "Only IPv4 CIDRs are allowed.")
+    if not is_private_cidr(str(network)):
+        return fail("allow", "Only RFC1918 private IPv4 networks are allowed.")
+
+    value = str(network)
+    try:
+        os.makedirs(os.path.dirname(ALLOWED_FILE), exist_ok=True)
+        tmp = ALLOWED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"networks": [value]}, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, ALLOWED_FILE)
+        emit({
+            "ok": True,
+            "command": "allow",
+            "network": value,
+            "allowed_networks": allowed_networks(),
+        })
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        return fail("allow", "Could not write allowlist: {}".format(exc))
 
 
 def normalize_mac(mac: str) -> Optional[str]:
@@ -518,6 +567,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Verify the EmbedXPL engine is importable")
 
+    allow = sub.add_parser("allow", help="Write one lab CIDR to the allowlist")
+    allow.add_argument("--network", required=True, help="Private IPv4 CIDR, e.g. 192.168.0.0/24")
+
     discover = sub.add_parser("discover", help="Discover live devices on a CIDR")
     discover.add_argument("--network", required=True)
     discover.add_argument("--timing", type=int, default=4)
@@ -553,6 +605,7 @@ def main() -> int:
     args = parser.parse_args()
     handlers = {
         "doctor": cmd_doctor,
+        "allow": cmd_allow,
         "discover": cmd_discover,
         "fingerprint": cmd_fingerprint,
         "check": cmd_check,

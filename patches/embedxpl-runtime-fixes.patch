@@ -1,5 +1,5 @@
 diff --git a/embedxpl/core/discovery.py b/embedxpl/core/discovery.py
-index fef1da5..35d9f5a 100644
+index fef1da5..642bf8e 100644
 --- a/embedxpl/core/discovery.py
 +++ b/embedxpl/core/discovery.py
 @@ -421,16 +421,17 @@ class NetworkDiscovery:
@@ -22,16 +22,29 @@ index fef1da5..35d9f5a 100644
      ) -> None:
          """Read the OS ARP table and add discovered hosts."""
          if sys.platform == "win32":
-@@ -465,6 +466,8 @@ class NetworkDiscovery:
+@@ -465,6 +466,10 @@ class NetworkDiscovery:
                      continue
                  ip_str = parts[0]
                  mac_str = parts[2].upper()
 +                if not re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac_str):
-+                    mac_str = ""
++                    # Skip incomplete/stale ARP entries such as "<incomplete>"
++                    # or "WLAN0" instead of treating them as live hosts.
++                    continue
  
              try:
                  ip_obj = ipaddress.ip_address(ip_str)
-@@ -918,7 +921,7 @@ class NetworkDiscovery:
+@@ -581,7 +586,9 @@ class NetworkDiscovery:
+ 
+         if seen_ips and not is_single_host:
+             nmap_targets = " ".join(sorted(seen_ips))
+-            nmap_args = "-Pn -sV -sT --open -O --osscan-limit --max-retries 2"
++            # Version/OS detection is very slow on multiple hosts. Open-port
++            # detection is enough here; banners are collected separately.
++            nmap_args = "-Pn -sT --open --max-retries 1"
+             if callback:
+                 callback(
+                     "scan",
+@@ -918,7 +925,7 @@ class NetworkDiscovery:
          """Aggressive HTTP/HTTPS banner grab to extract device model from web UI."""
          http_ports = [p for p in host.open_ports if p in (80, 8080, 8081, 8888, 8090, 443, 8443, 4567, 10000)]
          if not http_ports:
@@ -40,7 +53,7 @@ index fef1da5..35d9f5a 100644
  
          for port in http_ports:
              use_ssl = port in (443, 8443)
-@@ -934,7 +937,7 @@ class NetworkDiscovery:
+@@ -934,7 +941,7 @@ class NetworkDiscovery:
          """Raw HTTP/HTTPS request to grab server headers and HTML title/model info."""
          try:
              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

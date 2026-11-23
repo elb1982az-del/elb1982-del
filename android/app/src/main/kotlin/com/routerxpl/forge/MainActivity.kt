@@ -301,6 +301,22 @@ private fun ipInCidr(ip: String, cidr: String): Boolean {
     return (network and mask) == (address and mask)
 }
 
+private fun isValidPrivateCidr(value: String): Boolean {
+    val parts = value.trim().split("/")
+    if (parts.size != 2) return false
+    val address = ipv4ToInt(parts[0]) ?: return false
+    val prefix = parts[1].toIntOrNull() ?: return false
+    if (prefix < 8 || prefix > 32) return false
+    val mask = (0xFFFFFFFFL shl (32 - prefix)) and 0xFFFFFFFFL
+    val network = address and mask
+    return when {
+        prefix >= 8 && (network and 0xFF000000L) == 0x0A000000L -> true
+        prefix >= 12 && (network and 0xFFF00000L) == 0xAC100000L -> true
+        prefix >= 16 && (network and 0xFFFF0000L) == 0xC0A80000L -> true
+        else -> false
+    }
+}
+
 private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
 private fun engineCall(context: Context, args: List<String>, timeoutSeconds: Long): JSONObject {
@@ -364,7 +380,7 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
     var tab by remember { mutableStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Checking engine...") }
-    var network by remember { mutableStateOf(prefs.getString("network", "192.168.1.0/24")!!) }
+    var network by remember { mutableStateOf(prefs.getString("network", "192.168.0.0/24")!!) }
     var chroot by remember { mutableStateOf(prefs.getString("chroot", DEFAULT_CHROOT)!!) }
     var enginePath by remember { mutableStateOf(prefs.getString("engine", DEFAULT_ENGINE)!!) }
 
@@ -382,9 +398,20 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
     var lastScannedNetwork by remember { mutableStateOf(network.trim()) }
     var wakeTarget by remember { mutableStateOf<KnownDevice?>(null) }
 
-    fun runStep(args: List<String>, onOk: (JSONObject) -> Unit) {
+    fun runStep(args: List<String>, before: List<String>? = null, onOk: (JSONObject) -> Unit) {
         scope.launch {
             busy = true
+            if (before != null) {
+                status = "Saving lab CIDR ..."
+                val prepared = withContext(Dispatchers.IO) { engine(before, 60) }
+                if (!prepared.optBoolean("ok", false)) {
+                    busy = false
+                    val err = prepared.optString("error", "Could not save lab CIDR")
+                    status = err
+                    lastResult = "Error: $err"
+                    return@launch
+                }
+            }
             status = "Running ${args.first()} ..."
             val json = withContext(Dispatchers.IO) { engine(args, 600) }
             busy = false
@@ -410,7 +437,15 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
 
     fun discover() {
         val scanned = network.trim()
-        runStep(listOf("discover", "--network", scanned)) { json ->
+        if (!isValidPrivateCidr(scanned)) {
+            status = "Enter a private IPv4 CIDR, e.g. 192.168.0.0/24"
+            lastResult = "Invalid target network: $scanned"
+            return
+        }
+        runStep(
+            listOf("discover", "--network", scanned),
+            before = listOf("allow", "--network", scanned)
+        ) { json ->
             devices = (json.optJSONArray("hosts") ?: JSONArray()).objects()
             selectedDevice = null
             fingerprint = null
@@ -425,7 +460,8 @@ fun AppShell(db: ResultsDb, engine: (List<String>, Long) -> JSONObject) {
                     ipInCidr(device.ip, scanned) &&
                     device.ip !in liveIps
             }
-            lastResult = "Discovered ${devices.size} live device(s). " +
+            lastResult = "Allowlist set to $scanned. " +
+                "Discovered ${devices.size} live device(s). " +
                 "${sleepingDevices.size} saved device(s) appear asleep."
         }
     }
@@ -708,14 +744,19 @@ fun WorkflowTab(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        StepHeader(1, "Discover live devices", "ARP / nmap / scapy sweep on your lab CIDR")
+        StepHeader(1, "Discover live devices", "Type a private CIDR; Discover saves it to the allowlist automatically")
         OutlinedTextField(
             value = network,
             onValueChange = onNetworkChange,
-            label = { Text("Target network") },
-            placeholder = { Text("192.168.1.0/24") },
+            label = { Text("Target network (CIDR)") },
+            placeholder = { Text("192.168.0.0/24") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            "Discover writes this CIDR to allowed_networks.json, then scans it. RFC1918 ranges only.",
+            color = Muted,
+            fontSize = 11.sp,
         )
         Button(
             onClick = onDiscover,
@@ -966,7 +1007,7 @@ fun SetupTab(
     ) {
         Text("NetHunter setup", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
         Text(
-            "Run engine/install.sh inside the Kali chroot once, then set your lab CIDRs in allowed_networks.json.",
+            "Run engine/install.sh inside the Kali chroot once. You no longer need to edit allowed_networks.json; type the lab CIDR on the Scan tab and tap Discover.",
             color = Muted,
             fontSize = 12.sp,
         )
