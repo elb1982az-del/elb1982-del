@@ -1,5 +1,6 @@
 # RouterXPL-Forge (NetHunter APK)
-
+> ⚠️ **WARNING: AUTHORIZED LAB USE ONLY**
+> This tool is designed for security testing on devices and networks you explicitly own or have written permission to test. The author is not responsible for any misuse or illegal activity.
 An Android controller app for **authorized** router / embedded-device security testing. It drives the full
 [EmbedXPL-Forge](https://github.com/Zeeeepa/EmbedXPL-Forge) module set from a rooted Kali NetHunter phone.
 
